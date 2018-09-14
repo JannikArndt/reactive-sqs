@@ -6,11 +6,12 @@ import akka.stream.scaladsl.{Flow, Keep}
 import akka.{Done, NotUsed}
 import com.amazonaws.services.sqs.AmazonSQSAsync
 import com.amazonaws.services.sqs.model.Message
+import com.typesafe.scalalogging.StrictLogging
 
 import scala.concurrent.{ExecutionContext, Future}
 
-object SqsService {
-  def create(queueUrl: String, maxMessagesInFlight: Int)(
+object SqsService extends StrictLogging {
+  def create(queueUrl: String, maxMessagesInFlight: Int, businessLogic: BusinessLogic)(
       implicit system: ActorSystem,
       client: AmazonSQSAsync
   ): (KillSwitch, Future[Done]) = {
@@ -18,13 +19,12 @@ object SqsService {
     implicit val mat: ActorMaterializer = ActorMaterializer()
     implicit val executionContext: ExecutionContext = system.dispatcher
 
+    val source = SqsSource(queueUrl).viaMat(KillSwitches.single)(Keep.right)
+    val sink = SqsAckSink(queueUrl, SqsAckSinkSettings(maxMessagesInFlight))
     val flow = Flow[Message]
       .via(readMessage)
       .via(handleMessage)
       .withAttributes(ActorAttributes.supervisionStrategy(Supervision.resumingDecider))
-
-    val source = SqsSource(queueUrl).viaMat(KillSwitches.single)(Keep.right)
-    val sink = SqsAckSink(queueUrl, SqsAckSinkSettings(maxMessagesInFlight))
 
     source
       .via(flow)
@@ -34,18 +34,20 @@ object SqsService {
 
   def readMessage: Flow[Message, (Message, Option[MyMessage]), NotUsed] =
     Flow.fromFunction { message: Message =>
-      val result = MyMessage(message.getBody)
-      (message, Some(result))
+      if (message.getBody.length > 0)
+        (message, Some(MyMessage(message.getBody)))
+      else
+        (message, None)
     }
 
   def handleMessage: Flow[(Message, Option[MyMessage]), (Message, MessageAction), NotUsed] =
     Flow.fromFunction {
       case (sqsMessage: Message, Some(myMessage)) =>
-        println(s"Content: ${myMessage.content}")
+        logger.info(s"Relaying message ${sqsMessage.getMessageId} to business logic.")
+        businessLogic.doBusinessLogic(myMessage)
         (sqsMessage, MessageAction.Delete)
       case (sqsMessage: Message, None) =>
-        println(s"Message ${sqsMessage.getMessageId} could not be parsed.")
-        // error handling
+        logger.error(s"Message ${sqsMessage.getMessageId} could not be parsed.")
         (sqsMessage, MessageAction.Delete)
     }
 
