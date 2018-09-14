@@ -14,8 +14,10 @@ object Main extends App {
 
   import scala.concurrent.ExecutionContext.Implicits.global
 
+  val sqsService = new SqsService(new BusinessLogic)
+
   val (killSwitch, completion): (KillSwitch, Future[Done]) =
-    SqsService.create("http://localhost:4576/queue/myqueue", 20)
+    sqsService.create("http://localhost:4576/queue/myqueue", 20)
 
   println(s"Running service. Press enter to stop.")
   StdIn.readLine()

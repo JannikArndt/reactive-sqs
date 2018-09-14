@@ -5,19 +5,23 @@ import akka.stream.alpakka.sqs.{MessageAction, SqsAckSinkSettings}
 import akka.stream.scaladsl.{Flow, Keep}
 import akka.{Done, NotUsed}
 import com.amazonaws.services.sqs.AmazonSQSAsync
-import com.amazonaws.services.sqs.model.Message
+import com.amazonaws.services.sqs.model.{Message, QueueDoesNotExistException}
 import com.typesafe.scalalogging.StrictLogging
 
+import scala.collection.JavaConverters.seqAsJavaList
 import scala.concurrent.{ExecutionContext, Future}
 
-object SqsService extends StrictLogging {
-  def create(queueUrl: String, maxMessagesInFlight: Int, businessLogic: BusinessLogic)(
+class SqsService(businessLogic: BusinessLogic) extends StrictLogging {
+
+  def create(queueUrl: String, maxMessagesInFlight: Int)(
       implicit system: ActorSystem,
       client: AmazonSQSAsync
   ): (KillSwitch, Future[Done]) = {
 
     implicit val mat: ActorMaterializer = ActorMaterializer()
     implicit val executionContext: ExecutionContext = system.dispatcher
+
+    assertQueueExists(queueUrl)
 
     val source = SqsSource(queueUrl).viaMat(KillSwitches.single)(Keep.right)
     val sink = SqsAckSink(queueUrl, SqsAckSinkSettings(maxMessagesInFlight))
@@ -44,13 +48,30 @@ object SqsService extends StrictLogging {
     Flow.fromFunction {
       case (sqsMessage: Message, Some(myMessage)) =>
         logger.info(s"Relaying message ${sqsMessage.getMessageId} to business logic.")
-        businessLogic.doBusinessLogic(myMessage)
+        if (businessLogic.validateMessage(myMessage))
+          businessLogic.doBusinessLogic(myMessage)
+        else
+          logger.error("Message is not valid: Must start with 'foo'")
         (sqsMessage, MessageAction.Delete)
       case (sqsMessage: Message, None) =>
         logger.error(s"Message ${sqsMessage.getMessageId} could not be parsed.")
         (sqsMessage, MessageAction.Delete)
     }
 
-  case class MyMessage(content: String)
-
+  /**
+    * FIXME: the aws sdk doesn't offer any functionality to check if a queue exists.
+    * If it doesn't, trying to read from it will NOT result in an error.
+    * Therefore we force an exception if the queue does not exist.
+    */
+  def assertQueueExists(queueUrl: String)(implicit client: AmazonSQSAsync): Unit =
+    try {
+      client.getQueueAttributes(queueUrl, seqAsJavaList(Seq("All")))
+      logger.info(s"Queue at $queueUrl found.")
+    } catch {
+      case queueDoesNotExistException: QueueDoesNotExistException =>
+        logger.error(s"The queue with url $queueUrl does not exist.")
+        throw queueDoesNotExistException
+    }
 }
+
+case class MyMessage(content: String)
